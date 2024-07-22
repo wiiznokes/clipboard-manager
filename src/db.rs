@@ -4,8 +4,10 @@ use cosmic::{
     iced_sctk::util,
 };
 use derivative::Derivative;
-use notify::Watcher;
+use futures::{SinkExt, StreamExt};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
+    any::TypeId,
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt::{Debug, Display},
@@ -17,6 +19,7 @@ use std::{
     thread::{self, sleep},
     time::Duration,
 };
+use tokio::time;
 
 use anyhow::{anyhow, bail, Result};
 use nucleo::{
@@ -246,6 +249,8 @@ impl Db {
             }
             DbMessage::LockWasRemoved => {
                 self.lock = LockFileState::try_lock(LOCK_FILE)?;
+
+                debug!("new lock: {:?}", self.lock);
             }
         };
 
@@ -585,76 +590,167 @@ fn get_base_path() -> PathBuf {
         .join(APPID)
 }
 
+// pub fn sub() -> Subscription<AppMessage> {
+//     subscription::run(|| {
+//         let (tx, rx) = mpsc::sync_channel(5);
+
+//         let path = directories::BaseDirs::new()
+//             .unwrap()
+//             .runtime_dir()
+//             .unwrap()
+//             .join(APPID);
+
+//         if !path.exists() {
+//             if let Err(err) = fs::create_dir_all(&path) {
+//                 error!("can't create runtime dir: {}", err);
+//             }
+//         }
+
+//         let mut e =
+//             notify::recommended_watcher(move |event_res: Result<notify::Event, notify::Error>| {
+//                 debug!("{:?}", event_res);
+
+//                 match event_res {
+//                     Ok(event) => match &event.kind {
+//                         notify::EventKind::Remove(_) => {
+//                             if event.paths[0].ends_with(LOCK_FILE) {
+//                                 if let Err(err) =
+//                                     tx.send(AppMessage::DbMessage(DbMessage::LockWasRemoved))
+//                                 {
+//                                     warn!("failed to send notify event: {:?}", err);
+//                                 }
+//                             }
+//                         }
+//                         notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
+//                             if event.paths[0].ends_with(MODIF_FILE) {
+//                                 let Ok(bytes) = fs::read(&event.paths[0]) else {
+//                                     return;
+//                                 };
+
+//                                 if bytes.len() == 4 {
+//                                     let id_bytes: [u8; 4] = bytes[0..4]
+//                                         .try_into()
+//                                         .expect("slice with incorrect length");
+//                                     let id = u32::from_ne_bytes(id_bytes);
+
+//                                     if let Err(err) =
+//                                         tx.send(AppMessage::DbMessage(DbMessage::DbWasWritten(id)))
+//                                     {
+//                                         warn!("failed to send notify event: {:?}", err);
+//                                     }
+//                                 }
+//                             }
+//                         }
+//                         _ => {}
+//                     },
+//                     Err(err) => {
+//                         warn!("failed to watch files: {:?}", err);
+//                     }
+//                 }
+//             })
+//             .unwrap();
+
+//         debug!("will watch {}", path.display());
+
+//         if let Err(err) = e.watch(&path, notify::RecursiveMode::NonRecursive) {
+//             warn!("failed to watch file: {:?}", err);
+//         }
+
+//         debug!("we are watching!");
+
+//         futures::stream::iter(rx)
+//     })
+// }
+
 pub fn sub() -> Subscription<AppMessage> {
-    subscription::run(|| {
-        let (tx, rx) = mpsc::channel();
+    struct WatcherSubscription;
 
-        let path = directories::BaseDirs::new()
-            .unwrap()
-            .runtime_dir()
-            .unwrap()
-            .join(APPID);
-
-        if !path.exists() {
-            if let Err(err) = fs::create_dir_all(&path) {
-                error!("can't create runtime dir: {}", err);
-            }
-        }
-
-        let mut e =
-            notify::recommended_watcher(move |event_res: Result<notify::Event, notify::Error>| {
-                debug!("{:?}", event_res);
-
-                match event_res {
-                    Ok(event) => match &event.kind {
-                        notify::EventKind::Remove(_) => {
-                            if event.paths[0].ends_with(LOCK_FILE) {
-                                if let Err(err) =
-                                    tx.send(AppMessage::DbMessage(DbMessage::LockWasRemoved))
-                                {
-                                    warn!("failed to send notify event: {:?}", err);
-                                }
-                            }
-                        }
-                        notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
-                            if event.paths[0].ends_with(MODIF_FILE) {
-                                let Ok(bytes) = fs::read(&event.paths[0]) else {
-                                    return;
-                                };
-
-                                if bytes.len() == 4 {
-                                    let id_bytes: [u8; 4] = bytes[0..4]
-                                        .try_into()
-                                        .expect("slice with incorrect length");
-                                    let id = u32::from_ne_bytes(id_bytes);
-
-                                    if let Err(err) =
-                                        tx.send(AppMessage::DbMessage(DbMessage::DbWasWritten(id)))
-                                    {
+    subscription::channel(
+        TypeId::of::<WatcherSubscription>(),
+        100,
+        |mut output| async move {
+            let watcher_res = {
+                //TODO: debounce ?
+                notify::recommended_watcher(
+                    move |event_res: Result<notify::Event, notify::Error>| match event_res {
+                        Ok(event) => match &event.kind {
+                            notify::EventKind::Remove(_) => {
+                                if event.paths[0].ends_with(LOCK_FILE) {
+                                    if let Err(err) = futures::executor::block_on(async {
+                                        output
+                                            .send(AppMessage::DbMessage(DbMessage::LockWasRemoved))
+                                            .await
+                                    }) {
                                         warn!("failed to send notify event: {:?}", err);
                                     }
                                 }
                             }
+                            notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
+                                if event.paths[0].ends_with(MODIF_FILE) {
+                                    let Ok(bytes) = fs::read(&event.paths[0]) else {
+                                        return;
+                                    };
+
+                                    if bytes.len() == 4 {
+                                        let id_bytes: [u8; 4] = bytes[0..4]
+                                            .try_into()
+                                            .expect("slice with incorrect length");
+                                        let id = u32::from_ne_bytes(id_bytes);
+
+                                        if let Err(err) = futures::executor::block_on(async {
+                                            output
+                                                .send(AppMessage::DbMessage(
+                                                    DbMessage::DbWasWritten(id),
+                                                ))
+                                                .await
+                                        }) {
+                                            warn!("failed to send notify event: {:?}", err);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        Err(err) => {
+                            warn!("failed to watch files: {:?}", err);
                         }
-                        _ => {}
                     },
-                    Err(err) => {
-                        warn!("failed to watch files: {:?}", err);
+                )
+            };
+
+            match watcher_res {
+                Ok(mut watcher) => {
+                    let path = directories::BaseDirs::new()
+                        .unwrap()
+                        .runtime_dir()
+                        .unwrap()
+                        .join(APPID);
+
+                    if !path.exists() {
+                        if let Err(err) = fs::create_dir_all(&path) {
+                            error!("can't create runtime dir: {}", err);
+                        }
+                    }
+
+                    if let Err(err) = watcher.watch(&path, notify::RecursiveMode::NonRecursive) {
+                        warn!("failed to watch file: {:?}", err);
+                    }
+
+                    // keep the watch in scope
+                    loop {
+                        time::sleep(time::Duration::new(1, 0)).await;
                     }
                 }
-            })
-            .unwrap();
+                Err(err) => {
+                    log::warn!("failed to create file watcher: {:?}", err);
+                }
+            }
 
-        debug!("will watch {}", path.display());
-
-        if let Err(err) = e.watch(&path, notify::RecursiveMode::NonRecursive) {
-            warn!("failed to watch file: {:?}", err);
-        }
-
-        debug!("we are watching!");
-
-        futures::stream::iter(rx)
-    })
+            loop {
+                time::sleep(time::Duration::new(1, 0)).await;
+            }
+        },
+    )
 }
 
 #[cfg(test)]
