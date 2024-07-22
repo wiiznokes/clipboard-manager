@@ -58,7 +58,7 @@ pub fn sub() -> Subscription<ClipboardMessage> {
                             // 1.the main one
                             // optional 2. metadata
                             let mime_type_filter = |mut mime_types: HashSet<String>| {
-                                debug!("mime type {:?}", mime_types);
+                                // debug!("mime type {:?}", mime_types);
 
                                 let mut request = Vec::new();
 
@@ -113,7 +113,7 @@ pub fn sub() -> Subscription<ClipboardMessage> {
                                     if !PRIVATE_MODE.load(atomic::Ordering::Relaxed) {
                                         tx.blocking_send(Some(res)).expect("can't send");
                                     } else {
-                                        log::info!("private mode")
+                                        info!("private mode")
                                     }
                                 }
                                 Err(e) => match e {
@@ -149,7 +149,7 @@ pub fn sub() -> Subscription<ClipboardMessage> {
 
                                     let data = Entry::new_now(mime_type, contents, metadata);
 
-                                    info!("sending data to database: {:?}", data);
+                                    // info!("sending data to database: {:?}", data);
                                     output.send(ClipboardMessage::Data(data)).await.unwrap();
                                 }
 
@@ -172,7 +172,7 @@ pub fn sub() -> Subscription<ClipboardMessage> {
                             .await
                             .expect("can't send");
                         loop {
-                            log::error!("inside error: {e}");
+                            error!("inside error: {e}");
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         }
                     }

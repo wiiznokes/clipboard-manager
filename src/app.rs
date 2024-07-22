@@ -43,6 +43,7 @@ pub struct AppState {
     pub db: Db,
     pub clipboard_state: ClipboardState,
     pub focused: usize,
+    pub id: u32,
 }
 
 impl AppState {
@@ -174,9 +175,13 @@ impl cosmic::Application for Window {
                 db: db::Db::new(&config).unwrap(),
                 clipboard_state: ClipboardState::Init,
                 focused: 0,
+                id: rand::random(),
             },
             config,
         };
+
+        
+        debug!("{:?}", window.state.db);
 
         #[cfg(debug_assertions)]
         let command = Command::single(Action::Future(Box::pin(async {
@@ -293,6 +298,11 @@ impl cosmic::Application for Window {
                 config_set!(private_mode, private_mode);
                 PRIVATE_MODE.store(private_mode, atomic::Ordering::Relaxed);
             }
+            AppMessage::DbMessage(inner) => {
+                if let Err(err) = self.state.db.update(inner) {
+                    error!("{}", err);
+                }
+            }
         }
         Command::none()
     }
@@ -326,7 +336,11 @@ impl cosmic::Application for Window {
         self.core.applet.popup_container(view).into()
     }
     fn subscription(&self) -> Subscription<Self::Message> {
-        let mut subscriptions = vec![config::sub(), navigation::sub().map(AppMessage::Navigation)];
+        let mut subscriptions = vec![
+            config::sub(),
+            navigation::sub().map(AppMessage::Navigation),
+            db::sub(),
+        ];
 
         if !self.state.clipboard_state.is_error() {
             subscriptions.push(clipboard::sub().map(AppMessage::ClipboardEvent));

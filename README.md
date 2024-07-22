@@ -46,5 +46,11 @@ Contributions are welcome
 To build and install the debug build
 
 ```sh
-just build-debug && sudo just debug=1 install
+just build-debug && sudo just debug=1 install && pkill cosmic-panel
+```
+
+or for release
+
+```sh
+just && sudo just install && pkill cosmic-panel
 ```

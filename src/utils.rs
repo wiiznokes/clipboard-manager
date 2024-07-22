@@ -1,9 +1,11 @@
 use std::cmp::min;
+use std::fs::File;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{borrow::Cow, time::Duration};
 use std::{fs, io};
 
+use anyhow::anyhow;
 use chrono::Utc;
 use cosmic::{app::Message, iced::Padding, iced_runtime::command::Action, Command};
 
@@ -107,4 +109,16 @@ pub fn remove_dir_contents(dir: &Path) {
     }
 
     let _ = inner(dir);
+}
+
+/// Also create parents
+pub fn create_file_all<P: AsRef<Path>>(path: P) -> anyhow::Result<File> {
+    let parents = path
+        .as_ref()
+        .parent()
+        .ok_or(anyhow!("no parent directory"))?;
+
+    std::fs::create_dir_all(parents)?;
+    let f = File::create(&path)?;
+    Ok(f)
 }

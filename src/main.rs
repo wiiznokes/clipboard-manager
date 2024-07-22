@@ -21,12 +21,12 @@ mod view;
 
 #[allow(unused_imports)]
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 fn setup_logs() {
     let fmt_layer = fmt::layer().with_target(false);
     let filter_layer = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new(format!(
-        "warn,{}=warn",
+        "warn,{}=debug",
         env!("CARGO_CRATE_NAME")
     )));
 

@@ -1,14 +1,20 @@
-use cosmic::iced_sctk::util;
+use alive_lock_file::LockFileState;
+use cosmic::{
+    iced::{subscription, Subscription},
+    iced_sctk::util,
+};
 use derivative::Derivative;
+use notify::Watcher;
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     fmt::{Debug, Display},
-    fs::{self, DirBuilder, File},
+    fs::{self, DirBuilder, File, OpenOptions},
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    thread::sleep,
+    sync::mpsc,
+    thread::{self, sleep},
     time::Duration,
 };
 
@@ -27,13 +33,19 @@ use rusqlite::{
 use crate::{
     app::{APP, APPID, ORG, QUALIFIER},
     config::Config,
+    message::AppMessage,
     utils::{self, remove_dir_contents},
 };
+
+use cached::proc_macro::cached;
 
 type TimeId = i64;
 
 const DB_VERSION: &str = "3";
 const DB_PATH: &str = constcat::concat!(APPID, "-db-", DB_VERSION, ".sqlite");
+
+const LOCK_FILE: &str = constcat::concat!(APPID, "/db.lock");
+const MODIF_FILE: &str = constcat::concat!(APPID, "/db.modif");
 
 // warning: if you change somethings in here, change the db version
 #[derive(Derivative)]
@@ -191,9 +203,81 @@ pub struct Db {
     query: String,
     needle: Option<Atom>,
     matcher: Matcher,
+    lock: LockFileState,
+    runtime_id: u32,
+    runtime_path: PathBuf,
+}
+
+impl Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Db")
+            .field("lock", &self.lock)
+            .field("runtime_id", &self.runtime_id)
+            .field("runtime_path", &self.runtime_path)
+            .finish()
+    }
 }
 
 impl Db {
+    fn notify_modif(&self) -> Result<()> {
+        debug!("notify_modif: {}", self.runtime_id);
+        let mut f = utils::create_file_all(self.runtime_path.join(MODIF_FILE))?;
+        f.write_all(&self.runtime_id.to_ne_bytes())?;
+
+        // todo: remove this assertion
+        let mut v = Vec::new();
+        File::open(self.runtime_path.join(MODIF_FILE))
+            .unwrap()
+            .read_to_end(&mut v)
+            .unwrap();
+
+        assert_eq!(&v, &self.runtime_id.to_ne_bytes());
+        Ok(())
+    }
+
+    pub fn update(&mut self, msg: DbMessage) -> Result<()> {
+        debug!("{:?}", msg);
+
+        match msg {
+            DbMessage::DbWasWritten(id) => {
+                if id != self.runtime_id {
+                    self.reload()?;
+                }
+            }
+            DbMessage::LockWasRemoved => {
+                self.lock = LockFileState::try_lock(LOCK_FILE)?;
+            }
+        };
+
+        Ok(())
+    }
+
+    fn reload(&mut self) -> Result<()> {
+        self.hashs.clear();
+        self.state.clear();
+
+        let query_load_table = r#"
+            SELECT creation, mime, content, metadataMime, metadata
+            FROM ClipboardEntries
+        "#;
+
+        {
+            let mut stmt = self.conn.prepare(query_load_table)?;
+
+            let mut rows = stmt.query(())?;
+
+            while let Some(row) = rows.next()? {
+                let data = Entry::from_row(row)?;
+
+                self.hashs.insert(data.get_hash(), data.creation);
+                self.state.insert(data.creation, data);
+            }
+        }
+
+        self.search();
+        Ok(())
+    }
+
     pub fn new(config: &Config) -> Result<Self> {
         let directories = directories::ProjectDirs::from(QUALIFIER, ORG, APP).unwrap();
 
@@ -234,6 +318,13 @@ impl Db {
                 query: String::default(),
                 needle: None,
                 matcher: Matcher::new(nucleo::Config::DEFAULT),
+                lock: LockFileState::try_lock(LOCK_FILE)?,
+                runtime_id: rand::random(),
+                runtime_path: directories::BaseDirs::new()
+                    .unwrap()
+                    .runtime_dir()
+                    .unwrap()
+                    .to_owned(),
             });
         }
 
@@ -271,37 +362,24 @@ impl Db {
             )?;
         }
 
-        let mut hashs = HashMap::default();
-        let mut state = BTreeMap::default();
-
-        let query_load_table = r#"
-            SELECT creation, mime, content, metadataMime, metadata
-            FROM ClipboardEntries
-        "#;
-
-        {
-            let mut stmt = conn.prepare(query_load_table)?;
-
-            let mut rows = stmt.query(())?;
-
-            while let Some(row) = rows.next()? {
-                let data = Entry::from_row(row)?;
-
-                hashs.insert(data.get_hash(), data.creation);
-                state.insert(data.creation, data);
-            }
-        }
-
-        let db = Db {
+        let mut db = Db {
             conn,
-            hashs,
-            state,
+            hashs: HashMap::default(),
+            state: BTreeMap::default(),
             filtered: Vec::default(),
             query: String::default(),
             needle: None,
             matcher: Matcher::new(nucleo::Config::DEFAULT),
+            lock: LockFileState::try_lock(LOCK_FILE)?,
+            runtime_id: rand::random(),
+            runtime_path: directories::BaseDirs::new()
+                .unwrap()
+                .runtime_dir()
+                .unwrap()
+                .to_owned(),
         };
 
+        db.reload()?;
         Ok(db)
     }
 
@@ -324,55 +402,12 @@ impl Db {
     // the <= 200 condition, is to unsure we reuse the same timestamp
     // of the first process that inserted the data.
     pub fn insert(&mut self, mut data: Entry) -> Result<()> {
-        // insert a new data, only if the last row is not the same AND was not created recently
-        let query_insert_if_not_exist = r#"
-            WITH last_row AS (
-                SELECT creation, mime, content, metadataMime, metadata
-                FROM ClipboardEntries
-                ORDER BY creation DESC
-                LIMIT 1
-            )
-            INSERT INTO ClipboardEntries (creation, mime, content, metadataMime, metadata)
-            SELECT :new_id, :new_mime, :new_content, :new_metadata_mime, :new_metadata
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM last_row AS lr
-                WHERE lr.content = :new_content AND (:now - lr.creation) <= 1000
-            );
-        "#;
-
-        if let Err(e) = self.conn.execute(
-            query_insert_if_not_exist,
-            named_params! {
-                ":new_id": data.creation,
-                ":new_mime": data.mime,
-                ":new_content": data.content,
-                ":new_metadata_mime": data.metadata.as_ref().map(|m| &m.0),
-                ":new_metadata": data.metadata.as_ref().map(|m| &m.1),
-                ":now": utils::now_millis(),
-            },
-        ) {
-            if let rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code, .. }, ..) = e {
-                if code == ErrorCode::ConstraintViolation {
-                    warn!("a different value with the same id was already inserted");
-                    data.creation += 1;
-                    return self.insert(data);
-                }
-            }
-            return Err(e.into());
-        }
-
-        // safe to unwrap since we insert before
-        let last_row = self.get_last_row()?.unwrap();
-
         let data_hash = data.get_hash();
 
         if let Some(old_id) = self.hashs.remove(&data_hash) {
             self.state.remove(&old_id);
 
-            // in case 2 same data were inserted in a short period
-            // we don't want to remove the old_id
-            if last_row.creation != old_id {
+            if self.lock.has_lock() {
                 let query_delete_old_id = r#"
                     DELETE FROM ClipboardEntries
                     WHERE creation = ?1;
@@ -382,7 +417,32 @@ impl Db {
             }
         }
 
-        data.creation = last_row.creation;
+        if self.lock.has_lock() {
+            let query_insert = r#"
+            INSERT INTO ClipboardEntries (creation, mime, content, metadataMime, metadata)
+            SELECT :new_id, :new_mime, :new_content, :new_metadata_mime, :new_metadata;
+        "#;
+
+            if let Err(e) = self.conn.execute(
+                query_insert,
+                named_params! {
+                    ":new_id": data.creation,
+                    ":new_mime": data.mime,
+                    ":new_content": data.content,
+                    ":new_metadata_mime": data.metadata.as_ref().map(|m| &m.0),
+                    ":new_metadata": data.metadata.as_ref().map(|m| &m.1),
+                },
+            ) {
+                if let rusqlite::Error::SqliteFailure(rusqlite::ffi::Error { code, .. }, ..) = e {
+                    if code == ErrorCode::ConstraintViolation {
+                        warn!("a different value with the same id was already inserted");
+                        data.creation += 1;
+                        return self.insert(data);
+                    }
+                }
+                return Err(e.into());
+            }
+        }
 
         self.hashs.insert(data_hash, data.creation);
         self.state.insert(data.creation, data);
@@ -399,10 +459,13 @@ impl Db {
 
         self.conn.execute(query, [data.creation])?;
 
+        _ = self.notify_modif();
+
         self.hashs.remove(&data.get_hash());
         self.state.remove(&data.creation);
 
         self.search();
+
         Ok(())
     }
 
@@ -411,6 +474,8 @@ impl Db {
             DELETE FROM ClipboardEntries
         "#;
         self.conn.execute(query_delete, [])?;
+
+        _ = self.notify_modif();
 
         self.state.clear();
         self.filtered.clear();
@@ -503,6 +568,93 @@ impl Db {
             self.filtered.len()
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum DbMessage {
+    DbWasWritten(u32),
+    LockWasRemoved,
+}
+
+#[cached]
+fn get_base_path() -> PathBuf {
+    directories::BaseDirs::new()
+        .unwrap()
+        .runtime_dir()
+        .unwrap()
+        .join(APPID)
+}
+
+pub fn sub() -> Subscription<AppMessage> {
+    subscription::run(|| {
+        let (tx, rx) = mpsc::channel();
+
+        let path = directories::BaseDirs::new()
+            .unwrap()
+            .runtime_dir()
+            .unwrap()
+            .join(APPID);
+
+        if !path.exists() {
+            if let Err(err) = fs::create_dir_all(&path) {
+                error!("can't create runtime dir: {}", err);
+            }
+        }
+
+        let mut e =
+            notify::recommended_watcher(move |event_res: Result<notify::Event, notify::Error>| {
+                debug!("{:?}", event_res);
+
+                match event_res {
+                    Ok(event) => match &event.kind {
+                        notify::EventKind::Remove(_) => {
+                            if event.paths[0].ends_with(LOCK_FILE) {
+                                if let Err(err) =
+                                    tx.send(AppMessage::DbMessage(DbMessage::LockWasRemoved))
+                                {
+                                    warn!("failed to send notify event: {:?}", err);
+                                }
+                            }
+                        }
+                        notify::EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
+                            if event.paths[0].ends_with(MODIF_FILE) {
+                                let Ok(bytes) = fs::read(&event.paths[0]) else {
+                                    return;
+                                };
+
+                                if bytes.len() == 4 {
+                                    let id_bytes: [u8; 4] = bytes[0..4]
+                                        .try_into()
+                                        .expect("slice with incorrect length");
+                                    let id = u32::from_ne_bytes(id_bytes);
+
+                                    if let Err(err) =
+                                        tx.send(AppMessage::DbMessage(DbMessage::DbWasWritten(id)))
+                                    {
+                                        warn!("failed to send notify event: {:?}", err);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    Err(err) => {
+                        warn!("failed to watch files: {:?}", err);
+                    }
+                }
+            })
+            .unwrap();
+
+        debug!("will watch {}", path.display());
+
+        if let Err(err) = e.watch(&path, notify::RecursiveMode::NonRecursive) {
+            warn!("failed to watch file: {:?}", err);
+        }
+
+        debug!("we are watching!");
+
+        futures::stream::iter(rx)
+    })
 }
 
 #[cfg(test)]
